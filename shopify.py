@@ -395,6 +395,8 @@ def reset_password(token):
             return redirect(url_for("forgot_password"))
 
         expires = datetime.fromisoformat(token_row["expires_at"])
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
         if expires < datetime.now(timezone.utc):
             flash("Token expired.", "error")
             return redirect(url_for("forgot_password"))
@@ -511,7 +513,7 @@ def purchase(course_id):
         ).fetchone()
 
         if request.method == "POST" and not existing:
-            payment_id = f"RZP-{secrets.token_hex(6).upper()}"
+            payment_id = f"PAY-{secrets.token_hex(6).upper()}"
             conn.execute(
                 "INSERT INTO enrollments (user_id, course_id, status, payment_id, amount, created_at) VALUES (?, ?, 'paid', ?, ?, ?)",
                 (user["id"], course_id, payment_id, course["sale_price"], utcnow_iso()),
@@ -570,7 +572,7 @@ def quiz(course_id):
             for q in questions:
                 selected = request.form.get(f"q_{q['id']}")
                 answer_map[str(q["id"])] = selected
-                if selected is not None and selected.isdigit() and int(selected) == q["correct_index"]:
+                if selected and selected.isdigit() and int(selected) == q["correct_index"]:
                     score += 1
 
             conn.execute(
